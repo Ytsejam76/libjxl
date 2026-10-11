@@ -179,7 +179,9 @@ Status CopyColorChannels(JxlChunkedFrameInputSource input, Rect rect,
                          const FrameInfo& frame_info,
                          const ImageMetadata& metadata, ThreadPool* pool,
                          Image3F* color, ImageF* alpha,
-                         bool* has_interleaved_alpha) {
+                         bool* has_interleaved_alpha,
+                         const float* fuse_xyb_intensity_target,
+                         bool* fused_xyb) {
   JxlPixelFormat format = {4, JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0};
   input.get_color_channels_pixel_format(input.opaque, &format);
   format.align = 0;  // align must be ignored.
@@ -201,10 +203,23 @@ Status CopyColorChannels(JxlChunkedFrameInputSource input, Rect rect,
                        color_channels, format.num_channels);
   }
   const uint8_t* data = reinterpret_cast<const uint8_t*>(buffer.get());
-  for (size_t c = 0; c < color_channels; ++c) {
-    JXL_RETURN_IF_ERROR(ConvertFromExternalPlaneNoSizeCheck(
-        data, rect.xsize(), rect.ysize(), row_offset, bits_per_sample, format,
-        c, pool, &color->Plane(c)));
+  // Fast path: 8-bit interleaved sRGB goes straight to XYB in a single pass,
+  // instead of being expanded to float planes and converted afterwards.
+  *fused_xyb = false;
+  if (fuse_xyb_intensity_target != nullptr && color_channels == 3 &&
+      format.data_type == JXL_TYPE_UINT8 && bits_per_sample == 8 &&
+      (format.num_channels == 3 || format.num_channels == 4) &&
+      row_offset >= rect.xsize() * format.num_channels) {
+    JXL_RETURN_IF_ERROR(SRGB8ToXYB(data, rect.xsize(), rect.ysize(), row_offset,
+                                   format.num_channels,
+                                   *fuse_xyb_intensity_target, pool, color));
+    *fused_xyb = true;
+  } else {
+    for (size_t c = 0; c < color_channels; ++c) {
+      JXL_RETURN_IF_ERROR(ConvertFromExternalPlaneNoSizeCheck(
+          data, rect.xsize(), rect.ysize(), row_offset, bits_per_sample, format,
+          c, pool, &color->Plane(c)));
+    }
   }
   if (color_channels == 1) {
     JXL_RETURN_IF_ERROR(CopyImageTo(color->Plane(0), &color->Plane(1)));
@@ -1589,10 +1604,21 @@ Status ComputeEncodingData(
   ImageF* black = black_eci ? &extra_channels[black_idx] : nullptr;
   bool has_interleaved_alpha = false;
   JxlChunkedFrameInputSource input = frame_data.GetInputSource();
+  // The input conversion can be fused with ToXYB when ToXYB would take its
+  // plain sRGB path: XYB output, sRGB input, no linear copy and no CMYK.
+  const bool want_linear = frame_header.encoding == FrameEncoding::kVarDCT &&
+                           cparams.speed_tier <= SpeedTier::kKitten;
+  const bool may_fuse_xyb =
+      !jpeg_data && frame_header.color_transform == ColorTransform::kXYB &&
+      frame_info.ib_needs_color_transform && !want_linear && !black &&
+      c_enc.IsSRGB() && !c_enc.IsGray();
+  const float intensity_target = metadata->m.IntensityTarget();
+  bool fused_xyb = false;
   if (!jpeg_data) {
-    JXL_RETURN_IF_ERROR(CopyColorChannels(input, patch_rect, frame_info,
-                                          metadata->m, pool, &color, alpha,
-                                          &has_interleaved_alpha));
+    JXL_RETURN_IF_ERROR(CopyColorChannels(
+        input, patch_rect, frame_info, metadata->m, pool, &color, alpha,
+        &has_interleaved_alpha, may_fuse_xyb ? &intensity_target : nullptr,
+        &fused_xyb));
   }
   JXL_RETURN_IF_ERROR(CopyExtraChannels(input, patch_rect, frame_info,
                                         metadata->m, has_interleaved_alpha,
@@ -1606,15 +1632,16 @@ Status ComputeEncodingData(
   if (!jpeg_data) {
     if (frame_header.color_transform == ColorTransform::kXYB &&
         frame_info.ib_needs_color_transform) {
-      if (frame_header.encoding == FrameEncoding::kVarDCT &&
-          cparams.speed_tier <= SpeedTier::kKitten) {
+      if (want_linear) {
         JXL_ASSIGN_OR_RETURN(linear_storage,
                              Image3F::Create(memory_manager, patch_rect.xsize(),
                                              patch_rect.ysize()));
         linear = &linear_storage;
       }
-      JXL_RETURN_IF_ERROR(ToXYB(c_enc, metadata->m.IntensityTarget(), black,
-                                pool, &color, cms, linear));
+      if (!fused_xyb) {
+        JXL_RETURN_IF_ERROR(ToXYB(c_enc, metadata->m.IntensityTarget(), black,
+                                  pool, &color, cms, linear));
+      }
     } else {
       // Nothing to do.
       // RGB or YCbCr: forward YCbCr is not implemented, this is only used

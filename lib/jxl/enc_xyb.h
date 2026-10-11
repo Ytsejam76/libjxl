@@ -26,6 +26,13 @@ Status ToXYB(const ColorEncoding& c_current, float intensity_target,
              const ImageF* black, ThreadPool* pool, Image3F* JXL_RESTRICT image,
              const JxlCmsInterface& cms, Image3F* JXL_RESTRICT linear);
 
+// Converts interleaved 8-bit sRGB (3 or 4 channels, the 4th is ignored) to
+// XYB, writing `image`. Equivalent to converting to float planes and calling
+// ToXYB() without a linear image, but in a single pass over memory.
+Status SRGB8ToXYB(const uint8_t* data, size_t xsize, size_t ysize,
+                  size_t stride, size_t num_channels, float intensity_target,
+                  ThreadPool* pool, Image3F* JXL_RESTRICT image);
+
 void LinearRGBRowToXYB(float* JXL_RESTRICT row0, float* JXL_RESTRICT row1,
                        float* JXL_RESTRICT row2,
                        const float* JXL_RESTRICT premul_absorb, size_t xsize);

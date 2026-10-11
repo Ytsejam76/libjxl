@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 
 #include "lib/jxl/base/common.h"
 #include "lib/jxl/frame_dimensions.h"
@@ -173,6 +174,85 @@ Status SRGBToXYB(const float* JXL_RESTRICT premul_absorb, ThreadPool* pool,
   JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, static_cast<uint32_t>(image->ysize()),
                                 ThreadPool::NoInit, process_row, "SRGBToXYB"));
   return true;
+}
+
+template <size_t kChannels>
+JXL_INLINE void SRGB8VecToXYB(const uint8_t* JXL_RESTRICT in,
+                              const float* JXL_RESTRICT premul_absorb,
+                              float* JXL_RESTRICT row0,
+                              float* JXL_RESTRICT row1,
+                              float* JXL_RESTRICT row2) {
+  namespace hn = hwy::HWY_NAMESPACE;
+  const HWY_FULL(float) d;
+  const hn::Rebind<uint8_t, decltype(d)> d8;
+  const hn::Rebind<uint32_t, decltype(d)> du;
+  hn::Vec<decltype(d8)> r8, g8, b8;
+  if (kChannels == 3) {
+    hn::LoadInterleaved3(d8, in, r8, g8, b8);
+  } else {
+    hn::Vec<decltype(d8)> a8;
+    hn::LoadInterleaved4(d8, in, r8, g8, b8, a8);
+  }
+  // Same rounding as LoadFloatRow: exact u8->float, then one multiply.
+  const auto scale = Set(d, 1.0f / 255);
+  const auto r = Mul(hn::ConvertTo(d, hn::PromoteTo(du, r8)), scale);
+  const auto g = Mul(hn::ConvertTo(d, hn::PromoteTo(du, g8)), scale);
+  const auto b = Mul(hn::ConvertTo(d, hn::PromoteTo(du, b8)), scale);
+  LinearRGBToXYB(LinearFromSRGB(r), LinearFromSRGB(g), LinearFromSRGB(b),
+                 premul_absorb, row0, row1, row2);
+}
+
+template <size_t kChannels>
+Status SRGB8ToXYBImpl(const uint8_t* data, size_t xsize, size_t ysize,
+                      size_t stride, const float* JXL_RESTRICT premul_absorb,
+                      ThreadPool* pool, Image3F* JXL_RESTRICT image) {
+  const HWY_FULL(float) d;
+  const size_t N = Lanes(d);
+  const auto process_row = [&](const uint32_t task,
+                               size_t /*thread*/) -> Status {
+    const size_t y = static_cast<size_t>(task);
+    const uint8_t* JXL_RESTRICT row_in = data + y * stride;
+    float* JXL_RESTRICT row0 = image->PlaneRow(0, y);
+    float* JXL_RESTRICT row1 = image->PlaneRow(1, y);
+    float* JXL_RESTRICT row2 = image->PlaneRow(2, y);
+    size_t x = 0;
+    for (; x + N <= xsize; x += N) {
+      SRGB8VecToXYB<kChannels>(row_in + kChannels * x, premul_absorb, row0 + x,
+                               row1 + x, row2 + x);
+    }
+    if (x < xsize) {
+      // Partial last vector: never read past the caller's buffer. Output rows
+      // are padded to a whole vector, as in SRGBToXYB.
+      HWY_ALIGN uint8_t tail[4 * HWY_MAX_LANES_D(HWY_FULL(float))] = {};
+      memcpy(tail, row_in + kChannels * x, kChannels * (xsize - x));
+      SRGB8VecToXYB<kChannels>(tail, premul_absorb, row0 + x, row1 + x,
+                               row2 + x);
+    }
+    return true;
+  };
+  JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, static_cast<uint32_t>(ysize),
+                                ThreadPool::NoInit, process_row, "SRGB8ToXYB"));
+  return true;
+}
+
+Status SRGB8ToXYB(const uint8_t* data, size_t xsize, size_t ysize,
+                  size_t stride, size_t num_channels, float intensity_target,
+                  ThreadPool* pool, Image3F* JXL_RESTRICT image) {
+  JXL_ENSURE(num_channels == 3 || num_channels == 4);
+  JXL_ENSURE(image->xsize() == xsize && image->ysize() == ysize);
+  JxlMemoryManager* memory_manager = image->memory_manager();
+  const HWY_FULL(float) d;
+  JXL_ASSIGN_OR_RETURN(
+      AlignedMemory mem,
+      AlignedMemory::Create(memory_manager, Lanes(d) * 12 * sizeof(float)));
+  float* premul_absorb = mem.address<float>();
+  ComputePremulAbsorb(intensity_target, premul_absorb);
+  if (num_channels == 3) {
+    return SRGB8ToXYBImpl<3>(data, xsize, ysize, stride, premul_absorb, pool,
+                             image);
+  }
+  return SRGB8ToXYBImpl<4>(data, xsize, ysize, stride, premul_absorb, pool,
+                           image);
 }
 
 Status SRGBToXYBAndLinear(const float* JXL_RESTRICT premul_absorb,
@@ -363,6 +443,14 @@ Status ToXYB(const ColorEncoding& c_current, float intensity_target,
              const JxlCmsInterface& cms, Image3F* const JXL_RESTRICT linear) {
   return HWY_DYNAMIC_DISPATCH(ToXYB)(c_current, intensity_target, black, pool,
                                      image, cms, linear);
+}
+
+HWY_EXPORT(SRGB8ToXYB);
+Status SRGB8ToXYB(const uint8_t* data, size_t xsize, size_t ysize,
+                  size_t stride, size_t num_channels, float intensity_target,
+                  ThreadPool* pool, Image3F* JXL_RESTRICT image) {
+  return HWY_DYNAMIC_DISPATCH(SRGB8ToXYB)(
+      data, xsize, ysize, stride, num_channels, intensity_target, pool, image);
 }
 
 HWY_EXPORT(LinearRGBRowToXYB);
