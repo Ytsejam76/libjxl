@@ -52,6 +52,8 @@ using hwy::HWY_NAMESPACE::Ge;
 using hwy::HWY_NAMESPACE::IfThenElse;
 using hwy::HWY_NAMESPACE::IfThenElseZero;
 using hwy::HWY_NAMESPACE::MaskFromVec;
+using hwy::HWY_NAMESPACE::NearestInt;
+using hwy::HWY_NAMESPACE::RebindMask;
 using hwy::HWY_NAMESPACE::Round;
 
 // NOTE: caller takes care of extracting quant from rect of RawQuantField.
@@ -377,6 +379,149 @@ void QuantizeRoundtripYBlockAC(PassesEncoderState* enc_state, const size_t size,
   }
 }
 
+// Fast path for 8x8 DCT blocks at speed tiers faster than kHare, where
+// quantization is not adjusted per block: DCT, Y quantization and
+// dequantization, chroma-from-luma, X/B quantization and DC extraction in one
+// pass over the block, with the same arithmetic (hence the same output) as
+// TransformFromPixels, QuantizeRoundtripYBlockAC, the CfL loop and
+// QuantizeBlockAC. With the AAN DCT the block never leaves registers.
+struct FusedDCT8Tables {
+  const float* inv_dequant[3];
+  const float* dequant_y;
+  float qm_multiplier[3];
+  // InvDequantMatrix * Scale() * quant * qm_multiplier, for `quant`.
+  int32_t quant = -1;
+  HWY_ALIGN float quant_matrix[3][kDCTBlockSize];
+  // Dead-zone thresholds, as in QuantizeRoundtripYBlockAC /
+  // ComputeCoefficients.
+  HWY_ALIGN float thres_y[kDCTBlockSize];
+  HWY_ALIGN float thres_xb[kDCTBlockSize];
+};
+
+void InitFusedDCT8Tables(const Quantizer& quantizer, float x_qm_multiplier,
+                         float b_qm_multiplier, FusedDCT8Tables* t) {
+  const float thres_y[4] = {0.56f, 0.62f, 0.62f, 0.62f};
+  const float thres_xb[4] = {0.58f, 0.62f, 0.62f, 0.62f};
+  for (size_t c = 0; c < 3; c++) {
+    t->inv_dequant[c] = quantizer.InvDequantMatrix(AcStrategyType::DCT, c);
+  }
+  t->dequant_y = quantizer.DequantMatrix(AcStrategyType::DCT, 1);
+  t->qm_multiplier[0] = x_qm_multiplier;
+  t->qm_multiplier[1] = 1.0f;
+  t->qm_multiplier[2] = b_qm_multiplier;
+  for (size_t k = 0; k < kDCTBlockSize; k++) {
+    const size_t quadrant =
+        (k / kBlockDim >= kBlockDim / 2) * 2 + (k % kBlockDim >= kBlockDim / 2);
+    t->thres_y[k] = thres_y[quadrant];
+    t->thres_xb[k] = thres_xb[quadrant];
+  }
+}
+
+void SetFusedDCT8Quant(const Quantizer& quantizer, int32_t quant,
+                       FusedDCT8Tables* t) {
+  if (quant == t->quant) return;
+  t->quant = quant;
+  const float qac = quantizer.Scale() * quant;
+  for (size_t c = 0; c < 3; c++) {
+    // Same products as QuantizeBlockAC computes.
+    const float quantv = qac * t->qm_multiplier[c];
+    for (size_t k = 0; k < kDCTBlockSize; k++) {
+      t->quant_matrix[c][k] = t->inv_dequant[c][k] * quantv;
+    }
+  }
+}
+
+template <class DF, class DI>
+JXL_INLINE Vec<DI> QuantizeFused(DF df, DI di, Vec<DF> val, Vec<DF> threshold) {
+  return IfThenElseZero(RebindMask(di, Ge(Abs(val), threshold)),
+                        NearestInt(val));
+}
+
+// One vector of coefficients k.. of the three channels (scaled as by
+// ComputeScaledDCT).
+template <class DF>
+JXL_INLINE void EncodeDCT8VectorFused(DF df, size_t k, Vec<DF> x, Vec<DF> y,
+                                      Vec<DF> b, const FusedDCT8Tables& t,
+                                      Vec<DF> inv_qac, Vec<DF> x_factor,
+                                      Vec<DF> b_factor,
+                                      const float* JXL_RESTRICT biases,
+                                      int32_t* JXL_RESTRICT quantized,
+                                      float* JXL_RESTRICT dc) {
+  const Rebind<int32_t, DF> di;
+  const auto qy = QuantizeFused(df, di, Mul(Load(df, t.quant_matrix[1] + k), y),
+                                Load(df, t.thres_y + k));
+  Store(qy, di, quantized + kDCTBlockSize + k);
+  const auto yd =
+      Mul(Mul(AdjustQuantBias(di, 1, qy, biases), Load(df, t.dequant_y + k)),
+          inv_qac);
+  x = NegMulAdd(x_factor, yd, x);
+  b = NegMulAdd(b_factor, yd, b);
+  const auto thres_xb = Load(df, t.thres_xb + k);
+  Store(
+      QuantizeFused(df, di, Mul(Load(df, t.quant_matrix[0] + k), x), thres_xb),
+      di, quantized + k);
+  Store(
+      QuantizeFused(df, di, Mul(Load(df, t.quant_matrix[2] + k), b), thres_xb),
+      di, quantized + 2 * kDCTBlockSize + k);
+  if (k == 0) {
+    dc[0] = GetLane(x);
+    dc[1] = GetLane(y);
+    dc[2] = GetLane(b);
+  }
+}
+
+// pixels: the three planes' rows of the block. Writes the quantized X, Y, B
+// coefficients to `quantized` and their DCs to `dc`. SetFusedDCT8Quant must
+// have been called with the block's quant.
+void EncodeDCT8BlockFused(const FusedDCT8Tables& t, const float* const* pixels,
+                          size_t stride, float inv_qac, float x_factor,
+                          float b_factor, const float* JXL_RESTRICT biases,
+                          float* JXL_RESTRICT coefficients,
+                          float* JXL_RESTRICT scratch_space,
+                          int32_t* JXL_RESTRICT quantized,
+                          float* JXL_RESTRICT dc) {
+#ifdef JXL_ENC_HAVE_AAN_DCT8
+  (void)coefficients;
+  (void)scratch_space;
+  const DAan d;
+  using V = Vec<DAan>;
+  V vx[8][kAanVecsPerRow];
+  V vy[8][kAanVecsPerRow];
+  V vb[8][kAanVecsPerRow];
+  AanDCT8x8UnscaledRegs(pixels[0], stride, vx);
+  AanDCT8x8UnscaledRegs(pixels[1], stride, vy);
+  AanDCT8x8UnscaledRegs(pixels[2], stride, vb);
+  const V inv_qacv = Set(d, inv_qac);
+  const V xf = Set(d, x_factor);
+  const V bf = Set(d, b_factor);
+  for (size_t i = 0; i < 8; i++) {
+    for (size_t h = 0; h < kAanVecsPerRow; h++) {
+      const size_t k = 8 * i + h * kAanLanes;
+      // Same scaling as AanDCT8x8.
+      const V scale = Load(d, kAanScales + k);
+      EncodeDCT8VectorFused(d, k, Mul(vx[i][h], scale), Mul(vy[i][h], scale),
+                            Mul(vb[i][h], scale), t, inv_qacv, xf, bf, biases,
+                            quantized, dc);
+    }
+  }
+#else
+  const HWY_CAPPED(float, kDCTBlockSize) df;
+  for (size_t c = 0; c < 3; c++) {
+    ComputeScaledDCT<8, 8>()(DCTFrom(pixels[c], stride),
+                             coefficients + c * kDCTBlockSize, scratch_space);
+  }
+  const auto inv_qacv = Set(df, inv_qac);
+  const auto xf = Set(df, x_factor);
+  const auto bf = Set(df, b_factor);
+  for (size_t k = 0; k < kDCTBlockSize; k += Lanes(df)) {
+    EncodeDCT8VectorFused(df, k, Load(df, coefficients + k),
+                          Load(df, coefficients + kDCTBlockSize + k),
+                          Load(df, coefficients + 2 * kDCTBlockSize + k), t,
+                          inv_qacv, xf, bf, biases, quantized, dc);
+  }
+#endif
+}
+
 Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
                            const Image3F& opsin, const Rect& rect,
                            Image3F* dc) {
@@ -433,6 +578,14 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
     HWY_ALIGN float* coeffs_in = fmem.address<float>();
     HWY_ALIGN int32_t* quantized = mem.address<int32_t>();
 
+    const bool fused_dct8 = cparams.speed_tier > SpeedTier::kHare;
+    FusedDCT8Tables fused_tables;
+    if (fused_dct8) {
+      InitFusedDCT8Tables(enc_state->shared.quantizer,
+                          enc_state->x_qm_multiplier,
+                          enc_state->b_qm_multiplier, &fused_tables);
+    }
+
     for (size_t by = 0; by < ysize_blocks; ++by) {
       int32_t* JXL_RESTRICT row_quant_ac =
           block_group_rect.Row(&full_quant_field, by);
@@ -472,8 +625,33 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
 
           size_t size = kDCTBlockSize * xblocks * yblocks;
 
-          // DCT Y channel, roundtrip-quantize it and set DC.
           int32_t quant_ac = row_quant_ac[bx];
+          if (fused_dct8 && acs.Strategy() == AcStrategyType::DCT) {
+            const Quantizer& quantizer = enc_state->shared.quantizer;
+            const float* block_rows[3] = {opsin_rows[0] + bx * kBlockDim,
+                                          opsin_rows[1] + bx * kBlockDim,
+                                          opsin_rows[2] + bx * kBlockDim};
+            float block_dc[3];
+            SetFusedDCT8Quant(quantizer, quant_ac, &fused_tables);
+            EncodeDCT8BlockFused(
+                fused_tables, block_rows, opsin_stride,
+                quantizer.inv_quant_ac(quant_ac),
+                enc_state->shared.cmap.base().YtoXRatio(row_cmap[0][tx]),
+                enc_state->shared.cmap.base().YtoBRatio(row_cmap[2][tx]),
+                kDefaultQuantBias, coeffs_in, scratch_space, quantized,
+                block_dc);
+            for (size_t c = 0; c < 3; c++) {
+              dc_rows[c][bx] = block_dc[c];
+              enc_state->progressive_splitter.SplitACCoefficients(
+                  quantized + c * size, acs, bx, by, coeffs[c]);
+              for (size_t p = 0; p < num_passes; p++) {
+                coeffs[c][p] += size;
+              }
+            }
+            continue;
+          }
+
+          // DCT Y channel, roundtrip-quantize it and set DC.
           for (size_t c : {0, 1, 2}) {
             TransformFromPixels(acs.Strategy(), opsin_rows[c] + bx * kBlockDim,
                                 opsin_stride, coeffs_in + c * size,
