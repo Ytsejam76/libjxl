@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 
 #include "lib/jxl/base/common.h"
 #include "lib/jxl/frame_dimensions.h"
@@ -34,14 +35,48 @@
 #include "lib/jxl/image_ops.h"
 #include "lib/jxl/memory_manager_internal.h"
 
+#ifndef LIB_JXL_ENC_XYB_CC_FAST_TABLES_
+#define LIB_JXL_ENC_XYB_CC_FAST_TABLES_
+namespace jxl {
+
+// Fast-tier opsin tables: positive floats are bit-monotonic, so the float's
+// bit pattern (clamped, shifted) indexes a log-spaced nearest-neighbor table
+// sampled at bucket midpoints. Max |error| in XYB is a few 1e-4, far below
+// one quantization step at any lossy distance; slow tiers (which also compute
+// a linear image for perceptual heuristics) keep the exact math.
+inline constexpr uint32_t kFastCbrtShift = 14;
+inline constexpr uint32_t kFastCbrtMinBits = 0x3B700000;  // ~0.00366 (< bias)
+inline constexpr uint32_t kFastCbrtMaxBits = 0x42800000;  // 64.0 (HDR mixed)
+inline constexpr size_t kFastCbrtSize =
+    ((kFastCbrtMaxBits - kFastCbrtMinBits) >> kFastCbrtShift) + 2;
+
+inline constexpr uint32_t kFastSrgbShift = 13;
+inline constexpr uint32_t kFastSrgbMinBits = 0x38000000;  // 2^-15
+inline constexpr uint32_t kFastSrgbMaxBits = 0x3F800000;  // 1.0
+inline constexpr size_t kFastSrgbSize =
+    ((kFastSrgbMaxBits - kFastSrgbMinBits) >> kFastSrgbShift) + 2;
+
+const float* FastCbrtTable();
+const float* FastSrgbToLinearTable();
+
+}  // namespace jxl
+#endif  // LIB_JXL_ENC_XYB_CC_FAST_TABLES_
+
 HWY_BEFORE_NAMESPACE();
 namespace jxl {
 namespace HWY_NAMESPACE {
 
 // These templates are not found via ADL.
 using hwy::HWY_NAMESPACE::Add;
+using hwy::HWY_NAMESPACE::BitCast;
+using hwy::HWY_NAMESPACE::GatherIndex;
+using hwy::HWY_NAMESPACE::Max;
+using hwy::HWY_NAMESPACE::Min;
 using hwy::HWY_NAMESPACE::Mul;
 using hwy::HWY_NAMESPACE::MulAdd;
+using hwy::HWY_NAMESPACE::RebindToSigned;
+using hwy::HWY_NAMESPACE::Set;
+using hwy::HWY_NAMESPACE::ShiftRight;
 using hwy::HWY_NAMESPACE::Sub;
 using hwy::HWY_NAMESPACE::ZeroIfNegative;
 
@@ -104,6 +139,58 @@ void LinearRGBToXYB(const V r, const V g, const V b,
   // For wide-gamut inputs, r/g/b and valx (but not y/z) are often negative.
 }
 
+// Table-based cbrt(x) + add for the fast tiers. Inputs below the table floor
+// (possible only for out-of-gamut values clamped by ZeroIfNegative) read the
+// first bucket, i.e. are treated as the opsin bias.
+template <class V>
+V FastCubeRootAndAdd(const V x, const V add) {
+  const HWY_FULL(float) df;
+  const hwy::HWY_NAMESPACE::RebindToSigned<decltype(df)> di;
+  auto bits = BitCast(di, x);
+  bits = Max(bits, Set(di, static_cast<int32_t>(kFastCbrtMinBits)));
+  bits = Min(bits, Set(di, static_cast<int32_t>(kFastCbrtMaxBits)));
+  const auto idx = ShiftRight<kFastCbrtShift>(
+      Sub(bits, Set(di, static_cast<int32_t>(kFastCbrtMinBits))));
+  return Add(GatherIndex(df, FastCbrtTable(), idx), add);
+}
+
+// Table-based sRGB EOTF for the fast tiers; values below the table floor are
+// treated as black (their linear value is < 1e-6).
+template <class V>
+V FastLinearFromSRGB(V encoded) {
+  const HWY_FULL(float) df;
+  const hwy::HWY_NAMESPACE::RebindToSigned<decltype(df)> di;
+  auto bits = BitCast(di, encoded);
+  bits = Max(bits, Set(di, static_cast<int32_t>(kFastSrgbMinBits)));
+  bits = Min(bits, Set(di, static_cast<int32_t>(kFastSrgbMaxBits)));
+  const auto idx = ShiftRight<kFastSrgbShift>(
+      Sub(bits, Set(di, static_cast<int32_t>(kFastSrgbMinBits))));
+  return GatherIndex(df, FastSrgbToLinearTable(), idx);
+}
+
+// Converts one RGB vector to XYB with the table cbrt.
+template <class V>
+void LinearRGBToXYBFast(const V r, const V g, const V b,
+                        const float* JXL_RESTRICT premul_absorb,
+                        float* JXL_RESTRICT valx, float* JXL_RESTRICT valy,
+                        float* JXL_RESTRICT valz) {
+  V mixed0;
+  V mixed1;
+  V mixed2;
+  OpsinAbsorbance(r, g, b, premul_absorb, &mixed0, &mixed1, &mixed2);
+
+  mixed0 = ZeroIfNegative(mixed0);
+  mixed1 = ZeroIfNegative(mixed1);
+  mixed2 = ZeroIfNegative(mixed2);
+
+  const HWY_FULL(float) d;
+  const size_t N = Lanes(d);
+  mixed0 = FastCubeRootAndAdd(mixed0, Load(d, premul_absorb + 9 * N));
+  mixed1 = FastCubeRootAndAdd(mixed1, Load(d, premul_absorb + 10 * N));
+  mixed2 = FastCubeRootAndAdd(mixed2, Load(d, premul_absorb + 11 * N));
+  StoreXYB(mixed0, mixed1, mixed2, valx, valy, valz);
+}
+
 void LinearRGBRowToXYB(float* JXL_RESTRICT row0, float* JXL_RESTRICT row1,
                        float* JXL_RESTRICT row2,
                        const float* JXL_RESTRICT premul_absorb, size_t xsize) {
@@ -122,7 +209,7 @@ V LinearFromSRGB(V encoded) {
   return TF_SRGB().DisplayFromEncoded(encoded);
 }
 
-Status LinearSRGBToXYB(const float* JXL_RESTRICT premul_absorb,
+Status LinearSRGBToXYB(const float* JXL_RESTRICT premul_absorb, bool fast,
                        ThreadPool* pool, Image3F* JXL_RESTRICT image) {
   const size_t xsize = image->xsize();
 
@@ -138,8 +225,13 @@ Status LinearSRGBToXYB(const float* JXL_RESTRICT premul_absorb,
       const auto in_r = Load(d, row0 + x);
       const auto in_g = Load(d, row1 + x);
       const auto in_b = Load(d, row2 + x);
-      LinearRGBToXYB(in_r, in_g, in_b, premul_absorb, row0 + x, row1 + x,
-                     row2 + x);
+      if (fast) {
+        LinearRGBToXYBFast(in_r, in_g, in_b, premul_absorb, row0 + x, row1 + x,
+                           row2 + x);
+      } else {
+        LinearRGBToXYB(in_r, in_g, in_b, premul_absorb, row0 + x, row1 + x,
+                       row2 + x);
+      }
     }
     return true;
   };
@@ -149,8 +241,8 @@ Status LinearSRGBToXYB(const float* JXL_RESTRICT premul_absorb,
   return true;
 }
 
-Status SRGBToXYB(const float* JXL_RESTRICT premul_absorb, ThreadPool* pool,
-                 Image3F* JXL_RESTRICT image) {
+Status SRGBToXYB(const float* JXL_RESTRICT premul_absorb, bool fast,
+                 ThreadPool* pool, Image3F* JXL_RESTRICT image) {
   const size_t xsize = image->xsize();
 
   const HWY_FULL(float) d;
@@ -162,11 +254,19 @@ Status SRGBToXYB(const float* JXL_RESTRICT premul_absorb, ThreadPool* pool,
     float* JXL_RESTRICT row2 = image->PlaneRow(2, y);
 
     for (size_t x = 0; x < xsize; x += Lanes(d)) {
-      const auto in_r = LinearFromSRGB(Load(d, row0 + x));
-      const auto in_g = LinearFromSRGB(Load(d, row1 + x));
-      const auto in_b = LinearFromSRGB(Load(d, row2 + x));
-      LinearRGBToXYB(in_r, in_g, in_b, premul_absorb, row0 + x, row1 + x,
-                     row2 + x);
+      if (fast) {
+        const auto in_r = FastLinearFromSRGB(Load(d, row0 + x));
+        const auto in_g = FastLinearFromSRGB(Load(d, row1 + x));
+        const auto in_b = FastLinearFromSRGB(Load(d, row2 + x));
+        LinearRGBToXYBFast(in_r, in_g, in_b, premul_absorb, row0 + x,
+                           row1 + x, row2 + x);
+      } else {
+        const auto in_r = LinearFromSRGB(Load(d, row0 + x));
+        const auto in_g = LinearFromSRGB(Load(d, row1 + x));
+        const auto in_b = LinearFromSRGB(Load(d, row2 + x));
+        LinearRGBToXYB(in_r, in_g, in_b, premul_absorb, row0 + x, row1 + x,
+                       row2 + x);
+      }
     }
     return true;
   };
@@ -260,7 +360,8 @@ Status ToXYB(const ColorEncoding& c_current, float intensity_target,
     if (want_linear) {
       JXL_RETURN_IF_ERROR(CopyImageTo(*image, linear));
     }
-    JXL_RETURN_IF_ERROR(LinearSRGBToXYB(premul_absorb, pool, image));
+    JXL_RETURN_IF_ERROR(
+        LinearSRGBToXYB(premul_absorb, !want_linear, pool, image));
     return true;
   }
 
@@ -272,7 +373,7 @@ Status ToXYB(const ColorEncoding& c_current, float intensity_target,
       JXL_RETURN_IF_ERROR(
           SRGBToXYBAndLinear(premul_absorb, pool, image, linear));
     } else {
-      JXL_RETURN_IF_ERROR(SRGBToXYB(premul_absorb, pool, image));
+      JXL_RETURN_IF_ERROR(SRGBToXYB(premul_absorb, /*fast=*/true, pool, image));
     }
     return true;
   }
@@ -283,7 +384,8 @@ Status ToXYB(const ColorEncoding& c_current, float intensity_target,
   if (want_linear) {
     JXL_RETURN_IF_ERROR(CopyImageTo(*linear, image));
   }
-  JXL_RETURN_IF_ERROR(LinearSRGBToXYB(premul_absorb, pool, image));
+  JXL_RETURN_IF_ERROR(
+      LinearSRGBToXYB(premul_absorb, !want_linear, pool, image));
   return true;
 }
 
@@ -357,6 +459,45 @@ HWY_AFTER_NAMESPACE();
 
 #if HWY_ONCE
 namespace jxl {
+namespace {
+
+struct FastOpsinTables {
+  float cbrt[kFastCbrtSize];
+  float srgb[kFastSrgbSize];
+
+  FastOpsinTables() {
+    for (size_t i = 0; i < kFastCbrtSize; ++i) {
+      // Sample the midpoint of each bucket: halves the nearest error.
+      const uint32_t bits = kFastCbrtMinBits +
+                            (static_cast<uint32_t>(i) << kFastCbrtShift) +
+                            (1u << (kFastCbrtShift - 1));
+      float value;
+      memcpy(&value, &bits, sizeof(value));
+      cbrt[i] = cbrtf(value);
+    }
+    for (size_t i = 0; i < kFastSrgbSize; ++i) {
+      const uint32_t bits = kFastSrgbMinBits +
+                            (static_cast<uint32_t>(i) << kFastSrgbShift) +
+                            (1u << (kFastSrgbShift - 1));
+      float encoded;
+      memcpy(&encoded, &bits, sizeof(encoded));
+      srgb[i] = encoded <= 0.04045f
+                    ? encoded / 12.92f
+                    : std::pow((encoded + 0.055f) / 1.055f, 2.4f);
+    }
+  }
+};
+
+const FastOpsinTables& GetFastOpsinTables() {
+  static const FastOpsinTables tables;
+  return tables;
+}
+
+}  // namespace
+
+const float* FastCbrtTable() { return GetFastOpsinTables().cbrt; }
+const float* FastSrgbToLinearTable() { return GetFastOpsinTables().srgb; }
+
 HWY_EXPORT(ToXYB);
 Status ToXYB(const ColorEncoding& c_current, float intensity_target,
              const ImageF* black, ThreadPool* pool, Image3F* JXL_RESTRICT image,
