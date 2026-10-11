@@ -10,10 +10,15 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>     // memcpy
 #include <hwy/base.h>  // kMaxVectorSize
+#include <limits>
+#include <mutex>
+#include <utility>
+#include <vector>
 
 #include "lib/jxl/base/common.h"
 #include "lib/jxl/base/status.h"
@@ -23,11 +28,76 @@ namespace jxl {
 
 namespace {
 
-void* MemoryManagerDefaultAlloc(void* opaque, size_t size) {
-  return malloc(size);
+// Large buffers (image planes, coefficient images) are allocated and freed
+// many times during an encode. malloc serves them with fresh mmap()s and
+// unmaps them on free, so each reuse page-faults and zeroes the memory again,
+// which costs up to a third of the CPU time of fast encodes. The default
+// manager therefore keeps a bounded cache of freed large blocks and hands
+// them out again. Applications with their own JxlMemoryManager are not
+// affected.
+constexpr size_t kBlockHeaderSize = 64;  // Preserves malloc's alignment.
+constexpr size_t kMinCachedBlockSize = size_t{1} << 20;
+constexpr size_t kMaxCachedBytes = size_t{256} << 20;
+
+struct BlockCache {
+  std::mutex mutex;
+  std::vector<std::pair<size_t, void*>> blocks;  // (capacity, base pointer)
+  size_t cached_bytes = 0;
+};
+
+BlockCache& GetBlockCache() {
+  // Intentionally leaked: blocks may be freed during static destruction.
+  static BlockCache* cache = new BlockCache();
+  return *cache;
 }
 
-void MemoryManagerDefaultFree(void* opaque, void* address) { free(address); }
+void* MemoryManagerDefaultAlloc(void* opaque, size_t size) {
+  if (size >= kMinCachedBlockSize) {
+    BlockCache& cache = GetBlockCache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    // Best fit among the cached blocks that are at most twice as large.
+    size_t best = cache.blocks.size();
+    for (size_t i = 0; i < cache.blocks.size(); ++i) {
+      const size_t capacity = cache.blocks[i].first;
+      if (capacity >= size && capacity <= 2 * size &&
+          (best == cache.blocks.size() ||
+           capacity < cache.blocks[best].first)) {
+        best = i;
+      }
+    }
+    if (best != cache.blocks.size()) {
+      void* base = cache.blocks[best].second;
+      cache.cached_bytes -= cache.blocks[best].first;
+      cache.blocks[best] = cache.blocks.back();
+      cache.blocks.pop_back();
+      return static_cast<uint8_t*>(base) + kBlockHeaderSize;
+    }
+  }
+  if (size > std::numeric_limits<size_t>::max() - kBlockHeaderSize) {
+    return nullptr;
+  }
+  void* base = malloc(size + kBlockHeaderSize);
+  if (base == nullptr) return nullptr;
+  memcpy(base, &size, sizeof(size));
+  return static_cast<uint8_t*>(base) + kBlockHeaderSize;
+}
+
+void MemoryManagerDefaultFree(void* opaque, void* address) {
+  if (address == nullptr) return;
+  void* base = static_cast<uint8_t*>(address) - kBlockHeaderSize;
+  size_t size;
+  memcpy(&size, base, sizeof(size));
+  if (size >= kMinCachedBlockSize) {
+    BlockCache& cache = GetBlockCache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    if (cache.cached_bytes + size <= kMaxCachedBytes) {
+      cache.blocks.emplace_back(size, base);
+      cache.cached_bytes += size;
+      return;
+    }
+  }
+  free(base);
+}
 
 }  // namespace
 
