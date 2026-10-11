@@ -29,6 +29,221 @@ enum class AcStrategyType : uint32_t;
 namespace HWY_NAMESPACE {
 namespace {
 
+// 8x8 forward DCT using the Arai-Agui-Nakajima factorization (5 multiplies
+// and 29 additions per 1D transform, as in libjpeg-turbo's float DCT). The
+// block stays in registers, with one in-register transpose: 8 rows of one
+// 8-lane vector each (AVX2, AVX-512), or of two 4-lane vectors (SSE, NEON,
+// ...). The generic ComputeScaledDCT goes through memory at every stage.
+// AanDCT8x8 equals ComputeScaledDCT<8, 8> (same layout) up to rounding;
+// AanDCT8x8Unscaled leaves out the per-coefficient kAanScales multiply, so
+// that callers can fold it into their own per-coefficient processing.
+#undef JXL_ENC_HAVE_AAN_DCT8
+// SVE vector types are sizeless even on the fixed-width SVE targets, so they
+// cannot be held in the register arrays used here.
+#if !HWY_HAVE_SCALABLE && HWY_TARGET != HWY_SCALAR && \
+    (HWY_TARGET & HWY_ALL_SVE) == 0
+#define JXL_ENC_HAVE_AAN_DCT8 1
+
+using hwy::HWY_NAMESPACE::Add;
+using hwy::HWY_NAMESPACE::CappedTag;
+using hwy::HWY_NAMESPACE::ConcatLowerLower;
+using hwy::HWY_NAMESPACE::ConcatUpperUpper;
+using hwy::HWY_NAMESPACE::DFromV;
+using hwy::HWY_NAMESPACE::InterleaveLower;
+using hwy::HWY_NAMESPACE::InterleaveUpper;
+using hwy::HWY_NAMESPACE::Load;
+using hwy::HWY_NAMESPACE::LoadU;
+using hwy::HWY_NAMESPACE::MaxLanes;
+using hwy::HWY_NAMESPACE::Mul;
+using hwy::HWY_NAMESPACE::MulAdd;
+using hwy::HWY_NAMESPACE::Set;
+using hwy::HWY_NAMESPACE::StoreU;
+using hwy::HWY_NAMESPACE::Sub;
+using hwy::HWY_NAMESPACE::Vec;
+
+using DAan = CappedTag<float, 8>;
+constexpr size_t kAanLanes = MaxLanes(DAan());
+constexpr size_t kAanVecsPerRow = 8 / kAanLanes;
+static_assert(kAanLanes == 4 || kAanLanes == 8, "Unexpected vector size");
+
+// Scaled 1D DCT, one transform per lane; output k is scaled by a(k), where
+// a(0) = 1 and a(k) = sqrt(2) * cos(k * pi / 16).
+template <class V>
+JXL_INLINE void Aan1D(V& d0, V& d1, V& d2, V& d3, V& d4, V& d5, V& d6, V& d7) {
+  const DFromV<V> d;
+  const V k0707 = Set(d, 0.707106781f);
+  const V k0382 = Set(d, 0.382683433f);
+  const V k0541 = Set(d, 0.541196100f);
+  const V k1306 = Set(d, 1.306562965f);
+  const V tmp0 = Add(d0, d7);
+  const V tmp7 = Sub(d0, d7);
+  const V tmp1 = Add(d1, d6);
+  const V tmp6 = Sub(d1, d6);
+  const V tmp2 = Add(d2, d5);
+  const V tmp5 = Sub(d2, d5);
+  const V tmp3 = Add(d3, d4);
+  const V tmp4 = Sub(d3, d4);
+  // Even part.
+  const V tmp10 = Add(tmp0, tmp3);
+  const V tmp13 = Sub(tmp0, tmp3);
+  const V tmp11 = Add(tmp1, tmp2);
+  const V tmp12 = Sub(tmp1, tmp2);
+  d0 = Add(tmp10, tmp11);
+  d4 = Sub(tmp10, tmp11);
+  const V z1 = Mul(Add(tmp12, tmp13), k0707);
+  d2 = Add(tmp13, z1);
+  d6 = Sub(tmp13, z1);
+  // Odd part.
+  const V odd10 = Add(tmp4, tmp5);
+  const V odd11 = Add(tmp5, tmp6);
+  const V odd12 = Add(tmp6, tmp7);
+  const V z5 = Mul(Sub(odd10, odd12), k0382);
+  const V z2 = MulAdd(k0541, odd10, z5);
+  const V z4 = MulAdd(k1306, odd12, z5);
+  const V z3 = Mul(odd11, k0707);
+  const V z11 = Add(tmp7, z3);
+  const V z13 = Sub(tmp7, z3);
+  d5 = Add(z13, z2);
+  d3 = Sub(z13, z2);
+  d1 = Add(z11, z4);
+  d7 = Sub(z11, z4);
+}
+
+// Transposes four 4-lane rows in place.
+template <class V>
+JXL_INLINE void AanTranspose4x4(V& r0, V& r1, V& r2, V& r3) {
+  const DFromV<V> d;
+  const V q0 = InterleaveLower(d, r0, r2);
+  const V q1 = InterleaveLower(d, r1, r3);
+  const V q2 = InterleaveUpper(d, r0, r2);
+  const V q3 = InterleaveUpper(d, r1, r3);
+  r0 = InterleaveLower(d, q0, q1);
+  r1 = InterleaveUpper(d, q0, q1);
+  r2 = InterleaveLower(d, q2, q3);
+  r3 = InterleaveUpper(d, q2, q3);
+}
+
+// Transposes eight 8-lane rows in place.
+template <class V>
+JXL_INLINE void AanTranspose8x8(V* r) {
+  const DFromV<V> d;
+  const V q0 = InterleaveLower(d, r[0], r[2]);
+  const V q1 = InterleaveLower(d, r[1], r[3]);
+  const V q2 = InterleaveUpper(d, r[0], r[2]);
+  const V q3 = InterleaveUpper(d, r[1], r[3]);
+  const V q4 = InterleaveLower(d, r[4], r[6]);
+  const V q5 = InterleaveLower(d, r[5], r[7]);
+  const V q6 = InterleaveUpper(d, r[4], r[6]);
+  const V q7 = InterleaveUpper(d, r[5], r[7]);
+  const V s0 = InterleaveLower(d, q0, q1);
+  const V s1 = InterleaveUpper(d, q0, q1);
+  const V s2 = InterleaveLower(d, q2, q3);
+  const V s3 = InterleaveUpper(d, q2, q3);
+  const V s4 = InterleaveLower(d, q4, q5);
+  const V s5 = InterleaveUpper(d, q4, q5);
+  const V s6 = InterleaveLower(d, q6, q7);
+  const V s7 = InterleaveUpper(d, q6, q7);
+  r[0] = ConcatLowerLower(d, s4, s0);
+  r[1] = ConcatLowerLower(d, s5, s1);
+  r[2] = ConcatLowerLower(d, s6, s2);
+  r[3] = ConcatLowerLower(d, s7, s3);
+  r[4] = ConcatUpperUpper(d, s4, s0);
+  r[5] = ConcatUpperUpper(d, s5, s1);
+  r[6] = ConcatUpperUpper(d, s6, s2);
+  r[7] = ConcatUpperUpper(d, s7, s3);
+}
+
+// v[row][half]: transposes the 8x8 block in place.
+template <class V>
+JXL_INLINE void AanTransposeBlock(V (&v)[8][kAanVecsPerRow]) {
+  if (kAanVecsPerRow == 1) {
+    V r[8] = {v[0][0], v[1][0], v[2][0], v[3][0],
+              v[4][0], v[5][0], v[6][0], v[7][0]};
+    AanTranspose8x8(r);
+    for (size_t i = 0; i < 8; ++i) v[i][0] = r[i];
+  } else {
+    // Quadrant (I, J) moves to (J, I) and is transposed.
+    const size_t h = kAanVecsPerRow - 1;  // 1, written so that it compiles
+    AanTranspose4x4(v[0][0], v[1][0], v[2][0], v[3][0]);
+    AanTranspose4x4(v[4][h], v[5][h], v[6][h], v[7][h]);
+    AanTranspose4x4(v[0][h], v[1][h], v[2][h], v[3][h]);
+    AanTranspose4x4(v[4][0], v[5][0], v[6][0], v[7][0]);
+    for (size_t i = 0; i < 4; ++i) {
+      const V t = v[i][h];
+      v[i][h] = v[i + 4][0];
+      v[i + 4][0] = t;
+    }
+  }
+}
+
+// Unscaled AAN DCT of the 8x8 block at `pixels`, left in registers:
+// v[i][h] holds coefficients 8 * i + h * kAanLanes and following.
+template <class V>
+JXL_INLINE void AanDCT8x8UnscaledRegs(const float* JXL_RESTRICT pixels,
+                                      size_t stride,
+                                      V (&v)[8][kAanVecsPerRow]) {
+  const DAan d;
+  for (size_t i = 0; i < 8; ++i) {
+    for (size_t h = 0; h < kAanVecsPerRow; ++h) {
+      v[i][h] = LoadU(d, pixels + i * stride + h * kAanLanes);
+    }
+  }
+  for (size_t h = 0; h < kAanVecsPerRow; ++h) {  // Columns.
+    Aan1D(v[0][h], v[1][h], v[2][h], v[3][h], v[4][h], v[5][h], v[6][h],
+          v[7][h]);
+  }
+  AanTransposeBlock(v);
+  for (size_t h = 0; h < kAanVecsPerRow; ++h) {  // Rows.
+    Aan1D(v[0][h], v[1][h], v[2][h], v[3][h], v[4][h], v[5][h], v[6][h],
+          v[7][h]);
+  }
+}
+
+JXL_INLINE void AanDCT8x8Unscaled(const float* JXL_RESTRICT pixels,
+                                  size_t stride,
+                                  float* JXL_RESTRICT coefficients) {
+  const DAan d;
+  Vec<DAan> v[8][kAanVecsPerRow];
+  AanDCT8x8UnscaledRegs(pixels, stride, v);
+  for (size_t i = 0; i < 8; ++i) {
+    for (size_t h = 0; h < kAanVecsPerRow; ++h) {
+      StoreU(v[i][h], d, coefficients + 8 * i + h * kAanLanes);
+    }
+  }
+}
+
+// 1 / (64 * a(u) * a(v)) for coefficient u * 8 + v: removes the AAN output
+// scaling and applies the normalization of ComputeScaledDCT.
+HWY_ALIGN constexpr float kAanScales[64] = {
+    1.562500000e-02f, 1.126499722e-02f, 1.195885726e-02f, 1.328797023e-02f,
+    1.562500000e-02f, 1.988685282e-02f, 2.887123539e-02f, 5.663296540e-02f,
+    1.126499722e-02f, 8.121610390e-03f, 8.621855603e-03f, 9.580092652e-03f,
+    1.126499722e-02f, 1.433762187e-02f, 2.081500073e-02f, 4.083009265e-02f,
+    1.195885726e-02f, 8.621855603e-03f, 9.152913088e-03f, 1.017017211e-02f,
+    1.195885726e-02f, 1.522073819e-02f, 2.209708691e-02f, 4.334499517e-02f,
+    1.328797023e-02f, 9.580092652e-03f, 1.017017211e-02f, 1.130048978e-02f,
+    1.328797023e-02f, 1.691237813e-02f, 2.455296745e-02f, 4.816237813e-02f,
+    1.562500000e-02f, 1.126499722e-02f, 1.195885726e-02f, 1.328797023e-02f,
+    1.562500000e-02f, 1.988685282e-02f, 2.887123539e-02f, 5.663296540e-02f,
+    1.988685282e-02f, 1.433762187e-02f, 1.522073819e-02f, 1.691237813e-02f,
+    1.988685282e-02f, 2.531116257e-02f, 3.674611258e-02f, 7.208009265e-02f,
+    2.887123539e-02f, 2.081500073e-02f, 2.209708691e-02f, 2.455296745e-02f,
+    2.887123539e-02f, 3.674611258e-02f, 5.334708691e-02f, 1.046440752e-01f,
+    5.663296540e-02f, 4.083009265e-02f, 4.334499517e-02f, 4.816237813e-02f,
+    5.663296540e-02f, 7.208009265e-02f, 1.046440752e-01f, 2.052667373e-01f,
+};
+
+JXL_INLINE void AanDCT8x8(const float* JXL_RESTRICT pixels, size_t stride,
+                          float* JXL_RESTRICT coefficients) {
+  AanDCT8x8Unscaled(pixels, stride, coefficients);
+  const DAan d;
+  for (size_t i = 0; i < 64; i += kAanLanes) {
+    StoreU(Mul(LoadU(d, coefficients + i), Load(d, kAanScales + i)), d,
+           coefficients + i);
+  }
+}
+#endif  // !HWY_HAVE_SCALABLE && HWY_TARGET != HWY_SCALAR && !SVE
+
 constexpr size_t kMaxBlocks = 32;
 
 // Inverse of ReinterpretingDCT.
@@ -600,8 +815,12 @@ HWY_MAYBE_UNUSED void TransformFromPixels(const AcStrategyType strategy,
       break;
     }
     case Type::DCT: {
+#ifdef JXL_ENC_HAVE_AAN_DCT8
+      AanDCT8x8(pixels, pixels_stride, coefficients);
+#else
       ComputeScaledDCT<8, 8>()(DCTFrom(pixels, pixels_stride), coefficients,
                                scratch_space);
+#endif
       break;
     }
     case Type::AFV0: {
