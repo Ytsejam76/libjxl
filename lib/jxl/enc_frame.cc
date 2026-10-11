@@ -1153,11 +1153,15 @@ Status ComputeVarDCTEncodingData(const FrameHeader& frame_header,
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
   // Save pre-Gaborish opsin for AR control field heuristics computation.
   Image3F orig_opsin;
-  JXL_ASSIGN_OR_RETURN(
-      orig_opsin, Image3F::Create(memory_manager, rect.xsize(), rect.ysize()));
-  JXL_RETURN_IF_ERROR(CopyImageTo(rect, *opsin, Rect(orig_opsin), &orig_opsin));
-  JXL_RETURN_IF_ERROR(orig_opsin.ShrinkTo(enc_state->shared.frame_dim.xsize,
-                                          enc_state->shared.frame_dim.ysize));
+  if (UsesDynamicARHeuristics(frame_header, enc_state->cparams)) {
+    JXL_ASSIGN_OR_RETURN(
+        orig_opsin,
+        Image3F::Create(memory_manager, rect.xsize(), rect.ysize()));
+    JXL_RETURN_IF_ERROR(
+        CopyImageTo(rect, *opsin, Rect(orig_opsin), &orig_opsin));
+    JXL_RETURN_IF_ERROR(orig_opsin.ShrinkTo(enc_state->shared.frame_dim.xsize,
+                                            enc_state->shared.frame_dim.ysize));
+  }
 
   JXL_RETURN_IF_ERROR(LossyFrameHeuristics(frame_header, enc_state, enc_modular,
                                            linear, opsin, rect, cms, pool,
