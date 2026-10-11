@@ -889,6 +889,13 @@ float ComputeBlockL2Distance(const Image3F& a, const Image3F& b,
   return retval;
 }
 
+bool UsesDynamicARHeuristics(const FrameHeader& frame_header,
+                             const CompressParams& cparams) {
+  return cparams.butteraugli_distance >= kMinButteraugliForDynamicAR &&
+         cparams.speed_tier <= SpeedTier::kWombat &&
+         frame_header.loop_filter.epf_iters != 0;
+}
+
 Status ComputeARHeuristics(const FrameHeader& frame_header,
                            PassesEncoderState* enc_state,
                            const Image3F& orig_opsin, const Rect& rect,
@@ -901,9 +908,7 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
 
   float clamped_butteraugli = std::min(5.0f, cparams.butteraugli_distance);
-  if (cparams.butteraugli_distance < kMinButteraugliForDynamicAR ||
-      cparams.speed_tier > SpeedTier::kWombat ||
-      frame_header.loop_filter.epf_iters == 0) {
+  if (!UsesDynamicARHeuristics(frame_header, cparams)) {
     FillPlane(static_cast<uint8_t>(4), &epf_sharpness, Rect(epf_sharpness));
     return true;
   }
