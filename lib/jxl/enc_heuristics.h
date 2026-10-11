@@ -13,6 +13,7 @@
 #include "lib/jxl/base/data_parallel.h"
 #include "lib/jxl/base/rect.h"
 #include "lib/jxl/base/status.h"
+#include "lib/jxl/enc_params.h"
 #include "lib/jxl/frame_header.h"
 #include "lib/jxl/image.h"
 
@@ -35,6 +36,11 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
                             const Image3F* linear, Image3F* opsin,
                             const Rect& rect, const JxlCmsInterface& cms,
                             ThreadPool* pool, AuxOut* aux_out);
+
+// Whether ComputeARHeuristics() looks at the image; if not, `orig_opsin` may
+// be empty.
+bool UsesDynamicARHeuristics(const FrameHeader& frame_header,
+                             const CompressParams& cparams);
 
 Status ComputeARHeuristics(const FrameHeader& frame_header,
                            PassesEncoderState* enc_state,
