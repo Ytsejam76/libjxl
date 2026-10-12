@@ -2397,9 +2397,16 @@ Status EncodeFrameOneShot(JxlMemoryManager* memory_manager,
   JXL_RETURN_IF_ERROR(WriteTocPermutation(permutation, &writer, aux_out));
   JXL_RETURN_IF_ERROR(WriteTocSizes(group_sizes, &writer, aux_out));
 
-  JXL_RETURN_IF_ERROR(writer.AppendByteAligned(group_codes));
+  // Hand the header/TOC and then each group buffer straight to the output
+  // processor instead of first concatenating everything into one BitWriter,
+  // which would copy the whole compressed frame an extra time.
+  writer.ZeroPadToByte();
   PaddedBytes frame_bytes = std::move(writer).TakeBytes();
   JXL_RETURN_IF_ERROR(AppendData(*output_processor, frame_bytes));
+  for (const auto& bw : group_codes) {
+    JXL_ENSURE(bw->BitsWritten() % kBitsPerByte == 0);
+    JXL_RETURN_IF_ERROR(AppendData(*output_processor, bw->GetSpan()));
+  }
 
   return true;
 }
