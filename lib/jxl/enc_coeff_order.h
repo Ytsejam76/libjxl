@@ -28,7 +28,8 @@ enum class LayerType : uint8_t;
 // Orders that are actually used in part of image. `rect` is in block units.
 // Returns {orders that are used, orders that might be made non-default}.
 std::pair<uint32_t, uint32_t> ComputeUsedOrders(
-    SpeedTier speed, const AcStrategyImage& ac_strategy, const Rect& rect);
+    SpeedTier speed, const AcStrategyImage& ac_strategy, const Rect& rect,
+    bool default_order);
 
 // Modify zig-zag order, so that DCT bands with more zeros go later.
 // Order of DCT bands with same number of zeros is untouched, so
