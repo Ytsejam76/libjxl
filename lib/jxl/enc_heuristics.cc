@@ -1153,7 +1153,13 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
         memory_manager, cparams, modular_frame_encoder, &matrices));
   }
 
-  JXL_RETURN_IF_ERROR(cfl_heuristics.Init(rect));
+  // The CfL searches below only run at Hare speed or slower; faster tiers
+  // keep the default (all-zero) color correlation map, so skip allocating and
+  // clearing the DC regression storage.
+  const bool use_cfl = cparams.speed_tier <= SpeedTier::kHare;
+  if (use_cfl) {
+    JXL_RETURN_IF_ERROR(cfl_heuristics.Init(rect));
+  }
   JXL_RETURN_IF_ERROR(acs_heuristics.Init(*opsin, rect, initial_quant_field,
                                           initial_quant_masking,
                                           initial_quant_masking1x1, &matrices));
@@ -1188,8 +1194,12 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     // more accuracy. The initial quant field might change in slower modes, but
     // adjusting the quant field with butteraugli when all the other encoding
     // parameters are fixed is likely a more reliable choice anyway.
-    JXL_RETURN_IF_ERROR(AdjustQuantField(
-        ac_strategy, r, cparams.butteraugli_distance, &initial_quant_field));
+    // With DCT8 everywhere (Cheetah and faster) the adjustment reduces to
+    // writing every value onto itself, so skip the pass.
+    if (cparams.speed_tier < SpeedTier::kCheetah) {
+      JXL_RETURN_IF_ERROR(AdjustQuantField(
+          ac_strategy, r, cparams.butteraugli_distance, &initial_quant_field));
+    }
     quantizer.SetQuantFieldRect(initial_quant_field, r, &raw_quant_field);
 
     // Compute a non-default CfL map if we are at Hare speed, or slower.
@@ -1204,7 +1214,9 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
                      DivCeil(frame_dim.ysize_blocks, kEncTileDimInBlocks);
   const auto prepare = [&](const size_t num_threads) -> Status {
     JXL_RETURN_IF_ERROR(acs_heuristics.PrepareForThreads(num_threads));
-    JXL_RETURN_IF_ERROR(cfl_heuristics.PrepareForThreads(num_threads));
+    if (use_cfl) {
+      JXL_RETURN_IF_ERROR(cfl_heuristics.PrepareForThreads(num_threads));
+    }
     return true;
   };
   JXL_RETURN_IF_ERROR(
@@ -1212,8 +1224,11 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   JXL_RETURN_IF_ERROR(acs_heuristics.Finalize(frame_dim, ac_strategy, aux_out));
 
-  // Refine quantization levels.
-  if (!streaming_mode && !cparams.disable_perceptual_optimizations) {
+  // Refine quantization levels. Above Kitten speed FindBestQuantizer is a
+  // no-op unless max_error_mode, and epf_sharpness was already filled by
+  // ComputeARHeuristics, so skip the call entirely.
+  if (!streaming_mode && !cparams.disable_perceptual_optimizations &&
+      (cparams.speed_tier <= SpeedTier::kKitten || cparams.max_error_mode)) {
     ImageB& epf_sharpness = shared.epf_sharpness;
     FillPlane(static_cast<uint8_t>(4), &epf_sharpness, Rect(epf_sharpness));
     JXL_RETURN_IF_ERROR(FindBestQuantizer(frame_header, linear, *opsin,
