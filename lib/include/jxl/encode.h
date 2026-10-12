@@ -438,6 +438,14 @@ typedef enum {
    */
   JXL_ENC_FRAME_SETTING_JPEG_RECON_LFS = 42,
 
+  /** Use the default (zig-zag) coefficient order instead of computing a
+   * custom scan order from the image statistics. Skips a pass over all AC
+   * coefficients at encode time and a permutation table build at decode time,
+   * at a small density cost. -1 = default (custom orders allowed), 0 = custom
+   * orders allowed, 1 = use the default order.
+   */
+  JXL_ENC_FRAME_SETTING_DEFAULT_COEFF_ORDER = 43,
+
   /** Enum value not to be used as an option. This value is added to force the
    * C compiler to have the enum to take a known size.
    */

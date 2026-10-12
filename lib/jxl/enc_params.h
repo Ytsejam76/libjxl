@@ -39,6 +39,9 @@ struct CompressParams {
 
   bool disable_perceptual_optimizations = false;
 
+  // Use the default coefficient order instead of computing a custom one.
+  bool default_coeff_order = false;
+
   SpeedTier speed_tier = SpeedTier::kSquirrel;
   int brotli_effort = -1;
 

@@ -1197,7 +1197,8 @@ Status ComputeAllCoeffOrders(PassesEncoderState& enc_state,
                              const FrameDimensions& frame_dim) {
   auto used_orders_info = ComputeUsedOrders(
       enc_state.cparams.speed_tier, enc_state.shared.ac_strategy,
-      Rect(enc_state.shared.raw_quant_field));
+      Rect(enc_state.shared.raw_quant_field),
+      enc_state.cparams.default_coeff_order);
   enc_state.used_orders.resize(enc_state.progressive_splitter.GetNumPasses());
   for (size_t i = 0; i < enc_state.progressive_splitter.GetNumPasses(); i++) {
     JXL_RETURN_IF_ERROR(ComputeCoeffOrder(
