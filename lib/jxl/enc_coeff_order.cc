@@ -36,10 +36,10 @@ enum class LayerType : uint8_t;
 
 std::pair<uint32_t, uint32_t> ComputeUsedOrders(
     const SpeedTier speed, const AcStrategyImage& ac_strategy,
-    const Rect& rect) {
+    const Rect& rect, bool default_order) {
   // No coefficient reordering in Falcon or faster.
   // Only uses DCT8 = 0, so bitfield = 1.
-  if (speed >= SpeedTier::kFalcon) return {1, 1};
+  if (speed >= SpeedTier::kFalcon) return {1, default_order ? 0u : 1u};
 
   uint32_t ret = 0;
   uint32_t ret_customize = 0;
@@ -60,6 +60,7 @@ std::pair<uint32_t, uint32_t> ComputeUsedOrders(
   }
   // Use default orders for small images.
   if (ac_strategy.xsize() < 5 && ac_strategy.ysize() < 5) return {ret, 0};
+  if (default_order) return {ret, 0};
   return {ret, ret_customize};
 }
 
