@@ -82,6 +82,15 @@ void AuxOut::Assimilate(const AuxOut& victim) {
   num_dct32_blocks += victim.num_dct32_blocks;
   num_dct32x64_blocks += victim.num_dct32x64_blocks;
   num_dct64_blocks += victim.num_dct64_blocks;
+  if (ac_context_counts.size() < victim.ac_context_counts.size()) {
+    ac_context_counts.resize(victim.ac_context_counts.size());
+  }
+  for (size_t c = 0; c < victim.ac_context_counts.size(); ++c) {
+    std::vector<uint32_t>& dst = ac_context_counts[c];
+    const std::vector<uint32_t>& src = victim.ac_context_counts[c];
+    if (dst.size() < src.size()) dst.resize(src.size());
+    for (size_t i = 0; i < src.size(); ++i) dst[i] += src[i];
+  }
   num_butteraugli_iters += victim.num_butteraugli_iters;
 }
 

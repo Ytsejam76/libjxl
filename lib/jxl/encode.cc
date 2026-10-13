@@ -36,11 +36,13 @@
 #include "lib/jxl/base/sanitizers.h"
 #include "lib/jxl/base/span.h"
 #include "lib/jxl/base/status.h"
+#include "lib/jxl/ans_params.h"
 #include "lib/jxl/cms/color_encoding_cms.h"
 #include "lib/jxl/color_encoding_internal.h"
 #include "lib/jxl/enc_aux_out.h"
 #include "lib/jxl/enc_bit_writer.h"
 #include "lib/jxl/enc_cache.h"
+#include "lib/jxl/enc_context_map.h"
 #include "lib/jxl/enc_fast_lossless.h"
 #include "lib/jxl/enc_fields.h"
 #include "lib/jxl/enc_frame.h"
@@ -2996,6 +2998,42 @@ JxlEncoderStatus JxlEncoderSetFrameName(JxlEncoderFrameSettings* frame_settings,
   return JxlErrorOrStatus::Success();
 }
 
+JxlEncoderStatus JxlEncoderSetFrameACHistograms(
+    JxlEncoderFrameSettings* frame_settings, const uint8_t* context_map,
+    size_t num_contexts, const uint32_t* counts, size_t num_histograms,
+    size_t alphabet_size) {
+  jxl::CompressParams& cparams = frame_settings->values.cparams;
+  if (context_map == nullptr) {
+    cparams.ac_preset_context_map.clear();
+    cparams.ac_preset_counts.clear();
+    cparams.ac_preset_alphabet_size = 0;
+    return JxlErrorOrStatus::Success();
+  }
+  if (counts == nullptr || num_contexts == 0) {
+    return JXL_API_ERROR(frame_settings->enc, JXL_ENC_ERR_API_USAGE,
+                         "AC histograms need a context map and counts");
+  }
+  if (num_histograms == 0 || num_histograms > jxl::kClustersLimit) {
+    return JXL_API_ERROR(frame_settings->enc, JXL_ENC_ERR_API_USAGE,
+                         "Number of AC histograms has to be in [1..128]");
+  }
+  if (alphabet_size == 0 || alphabet_size > ANS_MAX_ALPHABET_SIZE) {
+    return JXL_API_ERROR(frame_settings->enc, JXL_ENC_ERR_API_USAGE,
+                         "AC histogram alphabet size has to be in [1..256]");
+  }
+  for (size_t i = 0; i < num_contexts; ++i) {
+    if (context_map[i] >= num_histograms) {
+      return JXL_API_ERROR(frame_settings->enc, JXL_ENC_ERR_API_USAGE,
+                           "AC context map entry out of range");
+    }
+  }
+  cparams.ac_preset_context_map.assign(context_map, context_map + num_contexts);
+  cparams.ac_preset_counts.assign(counts,
+                                  counts + num_histograms * alphabet_size);
+  cparams.ac_preset_alphabet_size = alphabet_size;
+  return JxlErrorOrStatus::Success();
+}
+
 JxlEncoderStatus JxlEncoderSetFrameBitDepth(
     JxlEncoderFrameSettings* frame_settings, const JxlBitDepth* bit_depth) {
   if (bit_depth->type != JXL_BIT_DEPTH_FROM_PIXEL_FORMAT &&
@@ -3106,6 +3144,24 @@ JXL_EXPORT size_t JxlEncoderStatsGet(const JxlEncoderStats* stats,
     default:
       return 0;
   }
+}
+
+JXL_EXPORT size_t JxlEncoderStatsGetACHistograms(const JxlEncoderStats* stats,
+                                                 uint32_t* counts,
+                                                 size_t num_contexts,
+                                                 size_t alphabet_size) {
+  if (!stats) return 0;
+  const auto& recorded = stats->aux_out->ac_context_counts;
+  if (counts != nullptr) {
+    for (size_t c = 0; c < num_contexts; ++c) {
+      for (size_t i = 0; i < alphabet_size; ++i) {
+        counts[c * alphabet_size + i] =
+            (c < recorded.size() && i < recorded[c].size()) ? recorded[c][i]
+                                                            : 0;
+      }
+    }
+  }
+  return recorded.size();
 }
 
 JXL_EXPORT void JxlEncoderStatsMerge(JxlEncoderStats* stats,

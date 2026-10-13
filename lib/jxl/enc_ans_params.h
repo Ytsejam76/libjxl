@@ -27,6 +27,9 @@ struct CompressParams;
 // RebalanceHistogram requires a signed type.
 using ANSHistBin = int32_t;
 
+struct Histogram;
+struct PresetHistograms;
+
 struct HistogramParams {
   enum class ClusteringType {
     kFastest,  // Only 4 clusters.
@@ -112,6 +115,13 @@ struct HistogramParams {
   bool streaming_mode = false;
   bool add_missing_symbols = false;
   bool add_fixed_histograms = false;
+  // If set, the token statistics are not measured and the context clustering
+  // is not computed: the preset context map and histograms are encoded and
+  // used as they are. Requires LZ77 to be disabled and a fixed uint config.
+  const PresetHistograms* preset = nullptr;
+  // If set, receives the measured per-context histograms (not available with
+  // a preset or LZ77).
+  std::vector<Histogram>* measured = nullptr;
 };
 
 struct Histogram {
@@ -190,6 +200,14 @@ struct Histogram {
   size_t total_count = 0;
   mutable float entropy = 0;  // WARNING: not kept up-to-date.
   static constexpr size_t kRounding = 8;
+};
+
+// Histograms chosen by the caller instead of being measured from the tokens:
+// `context_map` assigns every context to one of `histograms`. Every symbol
+// that can be emitted must have a non-zero count.
+struct PresetHistograms {
+  std::vector<uint8_t> context_map;
+  std::vector<Histogram> histograms;
 };
 
 }  // namespace jxl

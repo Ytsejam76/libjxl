@@ -64,7 +64,7 @@ std::vector<uint8_t> MoveToFrontTransform(const std::vector<uint8_t>& v) {
 
 Status EncodeContextMap(const std::vector<uint8_t>& context_map,
                         size_t num_histograms, BitWriter* writer,
-                        LayerType layer, AuxOut* aux_out) {
+                        LayerType layer, AuxOut* aux_out, bool try_mtf) {
   if (num_histograms == 1) {
     // Simple code
     writer->Write(1, 1);
@@ -85,16 +85,18 @@ Status EncodeContextMap(const std::vector<uint8_t>& context_map,
   }
   HistogramParams params;
   params.uint_method = HistogramParams::HybridUintMethod::kContextMap;
-  size_t ans_cost;
-  size_t mtf_cost;
-  {
+  // Without the MTF trial the map is coded as it is, and the two trial
+  // encodings that pick between the codings are skipped.
+  size_t ans_cost = 0;
+  size_t mtf_cost = 1;
+  if (try_mtf) {
     EntropyEncodingData codes;
     JXL_ASSIGN_OR_RETURN(
         ans_cost, BuildAndEncodeHistograms(memory_manager, params, 1, tokens,
                                            &codes, nullptr, LayerType::Header,
                                            /*aux_out*/ nullptr));
   }
-  {
+  if (try_mtf) {
     EntropyEncodingData codes;
     JXL_ASSIGN_OR_RETURN(
         mtf_cost, BuildAndEncodeHistograms(
@@ -110,7 +112,8 @@ Status EncodeContextMap(const std::vector<uint8_t>& context_map,
   }
   size_t entry_bits = CeilLog2Nonzero(num_histograms);
   size_t simple_cost = entry_bits * context_map.size();
-  if (entry_bits < 4 && simple_cost < ans_cost && simple_cost < mtf_cost) {
+  if (try_mtf && entry_bits < 4 && simple_cost < ans_cost &&
+      simple_cost < mtf_cost) {
     JXL_RETURN_IF_ERROR(writer->WithMaxBits(
         3 + entry_bits * context_map.size(), layer, aux_out, [&] {
           writer->Write(1, 1);
