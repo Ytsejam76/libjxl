@@ -11,6 +11,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace jxl {
 
@@ -104,6 +105,9 @@ struct AuxOut {
   size_t num_dct64_blocks = 0;
 
   int num_butteraugli_iters = 0;
+
+  // Per-context symbol counts of the AC tokens, summed over frames.
+  std::vector<std::vector<uint32_t>> ac_context_counts;
 };
 }  // namespace jxl
 

@@ -648,6 +648,37 @@ JXL_EXPORT JxlEncoderStatus JxlEncoderSetFrameBitDepth(
     JxlEncoderFrameSettings* frame_settings, const JxlBitDepth* bit_depth);
 
 /**
+ * Sets the histograms used to entropy code the AC coefficients of the next
+ * frames, instead of measuring them from each frame. This skips the token
+ * statistics, the context clustering and the histogram construction at encode
+ * time, at the cost of some density when the content does not match the
+ * histograms. The histograms are still written to the codestream, so any
+ * decoder can read the result.
+ *
+ * The histograms are used only when the encoder does not adapt the AC context
+ * model or the integer coding (effort 1 to 3, no streaming); otherwise, or if
+ * @p num_contexts does not match the frame's AC context count, the encoder
+ * measures the histograms as usual. The per-context counts to build the
+ * histograms from can be gathered with @ref JxlEncoderStatsGetACHistograms.
+ *
+ * @param frame_settings set of options and metadata for this frame. Also
+ * includes reference to the encoder object.
+ * @param context_map for each of the @p num_contexts AC contexts, the index of
+ * its histogram, smaller than @p num_histograms. NULL clears the histograms
+ * set previously.
+ * @param num_contexts number of AC contexts.
+ * @param counts @p num_histograms rows of @p alphabet_size symbol counts. Any
+ * scale is accepted; symbols with a zero count are still made encodable.
+ * @param num_histograms number of histograms, between 1 and 128.
+ * @param alphabet_size number of symbols per histogram, between 1 and 256.
+ * @return ::JXL_ENC_SUCCESS on success, ::JXL_ENC_ERROR on error
+ */
+JXL_EXPORT JxlEncoderStatus JxlEncoderSetFrameACHistograms(
+    JxlEncoderFrameSettings* frame_settings, const uint8_t* context_map,
+    size_t num_contexts, const uint32_t* counts, size_t num_histograms,
+    size_t alphabet_size);
+
+/**
  * Sets the buffer to read JPEG encoded bytes from for the next frame to encode.
  *
  * If @ref JxlEncoderSetBasicInfo has not yet been called, calling

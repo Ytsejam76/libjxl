@@ -924,8 +924,16 @@ StatusOr<size_t> EntropyEncodingData::BuildAndStoreEntropyCodes(
         HistogramFromSymbolInfo(encoding_info[i], use_prefix_code));
   }
   size_t context_offset = context_map.size();
-  context_map.resize(context_offset + builder.size());
-  if (builder.size() > 1) {
+  if (params.preset != nullptr) {
+    JXL_ENSURE(prev_histograms == 0 && context_offset == 0);
+    context_map = params.preset->context_map;
+    clustered_histograms = params.preset->histograms;
+    if (writer != nullptr && context_map.size() > 1) {
+      JXL_RETURN_IF_ERROR(EncodeContextMap(
+          context_map, clustered_histograms.size(), writer, layer, aux_out));
+    }
+  } else if (builder.size() > 1) {
+    context_map.resize(context_offset + builder.size());
     if (!ans_fuzzer_friendly_) {
       std::vector<uint32_t> histogram_symbols;
       JXL_RETURN_IF_ERROR(ClusterHistograms(params, builder, kClustersLimit,
@@ -955,6 +963,7 @@ StatusOr<size_t> EntropyEncodingData::BuildAndStoreEntropyCodes(
     }
   } else {
     JXL_ENSURE(encoding_info.empty());
+    context_map.resize(context_offset + builder.size());
     clustered_histograms.push_back(builder[0]);
   }
   if (aux_out != nullptr) {
@@ -1123,42 +1132,56 @@ StatusOr<size_t> BuildAndEncodeHistograms(
       tokens = std::move(tokens_lz77);
     }
     size_t total_tokens = 0;
-    // Build histograms.
-    std::vector<Histogram> builder(num_contexts);
+    // Build histograms, unless preset ones are used.
+    const bool use_preset = params.preset != nullptr;
+    if (use_preset) {
+      JXL_ENSURE(!codes->lz77.enabled);
+      JXL_ENSURE(params.uint_method != HistogramParams::HybridUintMethod::kBest &&
+                 params.uint_method != HistogramParams::HybridUintMethod::kFast);
+      JXL_ENSURE(params.preset->context_map.size() == num_contexts);
+      JXL_ENSURE(!params.add_fixed_histograms);
+    }
+    std::vector<Histogram> builder(use_preset ? 0 : num_contexts);
     HybridUintConfig uint_config = params.UintConfig();
     if (ans_fuzzer_friendly_) {
       uint_config = HybridUintConfig(10, 0, 0);
     }
-    for (const auto& stream : tokens) {
-      if (codes->lz77.enabled) {
-        for (const auto& token : stream) {
-          total_tokens++;
-          uint32_t tok, nbits, bits;
-          (token.is_lz77_length ? codes->lz77.length_uint_config : uint_config)
-              .Encode(token.value, &tok, &nbits, &bits);
-          tok += token.is_lz77_length ? codes->lz77.min_symbol : 0;
-          JXL_DASSERT(token.context < num_contexts);
-          builder[token.context].Add(tok);
-        }
-      } else if (num_contexts == 1) {
-        for (const auto& token : stream) {
-          total_tokens++;
-          uint32_t tok, nbits, bits;
-          uint_config.Encode(token.value, &tok, &nbits, &bits);
-          builder[0].Add(tok);
-        }
-      } else {
-        for (const auto& token : stream) {
-          total_tokens++;
-          uint32_t tok, nbits, bits;
-          uint_config.Encode(token.value, &tok, &nbits, &bits);
-          JXL_DASSERT(token.context < num_contexts);
-          builder[token.context].Add(tok);
+    if (!use_preset) {
+      for (const auto& stream : tokens) {
+        if (codes->lz77.enabled) {
+          for (const auto& token : stream) {
+            total_tokens++;
+            uint32_t tok, nbits, bits;
+            (token.is_lz77_length ? codes->lz77.length_uint_config : uint_config)
+                .Encode(token.value, &tok, &nbits, &bits);
+            tok += token.is_lz77_length ? codes->lz77.min_symbol : 0;
+            JXL_DASSERT(token.context < num_contexts);
+            builder[token.context].Add(tok);
+          }
+        } else if (num_contexts == 1) {
+          for (const auto& token : stream) {
+            total_tokens++;
+            uint32_t tok, nbits, bits;
+            uint_config.Encode(token.value, &tok, &nbits, &bits);
+            builder[0].Add(tok);
+          }
+        } else {
+          for (const auto& token : stream) {
+            total_tokens++;
+            uint32_t tok, nbits, bits;
+            uint_config.Encode(token.value, &tok, &nbits, &bits);
+            JXL_DASSERT(token.context < num_contexts);
+            builder[token.context].Add(tok);
+          }
         }
       }
     }
 
-    if (params.add_missing_symbols) {
+    if (params.measured != nullptr && !use_preset && !codes->lz77.enabled) {
+      *params.measured = builder;
+    }
+
+    if (params.add_missing_symbols && !use_preset) {
       for (size_t c = 0; c < num_contexts; ++c) {
         for (int symbol = 0; symbol < ANS_MAX_ALPHABET_SIZE; ++symbol) {
           builder[c].Add(symbol);
@@ -1168,10 +1191,10 @@ StatusOr<size_t> BuildAndEncodeHistograms(
 
     if (params.initialize_global_state) {
       bool use_prefix_code =
-          params.force_huffman || total_tokens < 100 ||
+          params.force_huffman || (!use_preset && total_tokens < 100) ||
           params.clustering == HistogramParams::ClusteringType::kFastest ||
           ans_fuzzer_friendly_;
-      if (!use_prefix_code) {
+      if (!use_prefix_code && !use_preset) {
         bool all_singleton = true;
         for (size_t i = 0; i < num_contexts; i++) {
           if (builder[i].ShannonEntropy() >= 1e-5) {
