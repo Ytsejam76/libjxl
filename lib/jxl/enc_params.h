@@ -42,6 +42,13 @@ struct CompressParams {
   // Use the default coefficient order instead of computing a custom one.
   bool default_coeff_order = false;
 
+  // Caller-provided AC histograms (see JxlEncoderSetFrameACHistograms): one
+  // histogram index per AC context, and num_histograms rows of
+  // ac_preset_alphabet_size counts. Empty if unset.
+  std::vector<uint8_t> ac_preset_context_map;
+  std::vector<uint32_t> ac_preset_counts;
+  size_t ac_preset_alphabet_size = 0;
+
   SpeedTier speed_tier = SpeedTier::kSquirrel;
   int brotli_effort = -1;
 

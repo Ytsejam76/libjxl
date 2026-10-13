@@ -86,6 +86,25 @@ typedef enum {
 JXL_EXPORT size_t JxlEncoderStatsGet(const JxlEncoderStats* stats,
                                      JxlEncoderStatsKey key);
 
+/** Returns the per-context symbol counts of the AC coefficient tokens of the
+ * frames encoded with these stats, summed over frames, for use with
+ * @ref JxlEncoderSetFrameACHistograms. Counts are recorded only for frames
+ * whose AC histograms were measured.
+ *
+ * @param stats object that was passed to the encoder with a
+ *   @ref JxlEncoderCollectStats function
+ * @param counts if not NULL, receives @p num_contexts rows of
+ *   @p alphabet_size counts; symbols beyond @p alphabet_size are dropped.
+ * @param num_contexts number of rows @p counts has room for.
+ * @param alphabet_size number of counts per row.
+ *
+ * @return the number of AC contexts recorded, 0 if none.
+ */
+JXL_EXPORT size_t JxlEncoderStatsGetACHistograms(const JxlEncoderStats* stats,
+                                                 uint32_t* counts,
+                                                 size_t num_contexts,
+                                                 size_t alphabet_size);
+
 /** Updates the values of the given stats object with that of an other.
  *
  * @param stats object whose values will be updated (usually added together)

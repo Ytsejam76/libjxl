@@ -1288,6 +1288,56 @@ Status EncodeGlobalDCInfo(const PassesSharedState& shared, BitWriter* writer,
   return true;
 }
 
+// Builds the caller-provided AC histograms (JxlEncoderSetFrameACHistograms)
+// into `preset`, if they fit this frame: same number of contexts, a fixed
+// uint config, no LZ77 and few enough histograms for the decoding speed.
+// Every symbol of the uint config alphabet gets a non-zero count, so any token
+// remains encodable; the counts are rescaled to keep the totals in range.
+bool PresetACHistograms(const CompressParams& cparams,
+                        const HistogramParams& hist_params, size_t num_contexts,
+                        PresetHistograms* preset) {
+  if (cparams.ac_preset_context_map.empty() ||
+      cparams.ac_preset_context_map.size() != num_contexts ||
+      hist_params.streaming_mode ||
+      hist_params.lz77_method != HistogramParams::LZ77Method::kNone ||
+      hist_params.uint_method == HistogramParams::HybridUintMethod::kBest ||
+      hist_params.uint_method == HistogramParams::HybridUintMethod::kFast) {
+    return false;
+  }
+  const size_t alphabet_size = cparams.ac_preset_alphabet_size;
+  const size_t num_histograms =
+      cparams.ac_preset_counts.size() / alphabet_size;
+  if (num_histograms > hist_params.max_histograms) return false;
+
+  // Largest token the fixed uint config produces for a 32-bit value.
+  uint32_t max_token;
+  uint32_t nbits;
+  uint32_t bits;
+  hist_params.UintConfig().Encode(~0u, &max_token, &nbits, &bits);
+  const size_t num_symbols = std::max<size_t>(alphabet_size, max_token + 1);
+  if (num_symbols > ANS_MAX_ALPHABET_SIZE) return false;
+
+  // Small totals keep the prefix codes within their depth limit, so building
+  // them needs no repeated passes that flatten the rarest counts.
+  constexpr uint64_t kMaxTotal = 1u << 14;
+  preset->context_map = cparams.ac_preset_context_map;
+  preset->histograms.assign(num_histograms, Histogram());
+  for (size_t h = 0; h < num_histograms; ++h) {
+    const uint32_t* row = &cparams.ac_preset_counts[h * alphabet_size];
+    uint64_t total = 0;
+    for (size_t i = 0; i < alphabet_size; ++i) total += row[i];
+    const uint64_t div = std::max<uint64_t>(1, DivCeil(total, kMaxTotal));
+    Histogram& histo = preset->histograms[h];
+    histo.EnsureCapacity(num_symbols);
+    for (size_t i = 0; i < num_symbols; ++i) {
+      const uint64_t count = i < alphabet_size ? row[i] / div : 0;
+      histo.counts[i] = static_cast<ANSHistBin>(std::max<uint64_t>(count, 1));
+    }
+    histo.Condition();
+  }
+  return true;
+}
+
 // In streaming mode, this function only performs the histogram clustering and
 // saves the histogram bitstreams in enc_state, the actual AC global bitstream
 // is written in OutputAcGlobal() function after all the groups are processed.
@@ -1353,14 +1403,37 @@ Status EncodeGlobalACInfo(PassesEncoderState* enc_state, BitWriter* writer,
     }
     hist_params.streaming_mode = enc_state->streaming_mode;
     hist_params.initialize_global_state = enc_state->initialize_global_state;
+    const size_t num_contexts =
+        num_histogram_groups * shared.block_ctx_map.NumACContexts();
+    PresetHistograms preset;
+    if (PresetACHistograms(enc_state->cparams, hist_params, num_contexts,
+                           &preset)) {
+      hist_params.preset = &preset;
+    }
+    std::vector<Histogram> measured;
+    if (aux_out != nullptr && hist_params.preset == nullptr) {
+      hist_params.measured = &measured;
+    }
     JXL_ASSIGN_OR_RETURN(
         size_t cost,
-        BuildAndEncodeHistograms(
-            memory_manager, hist_params,
-            num_histogram_groups * shared.block_ctx_map.NumACContexts(),
-            enc_state->passes[i].ac_tokens, &enc_state->passes[i].codes, writer,
-            LayerType::Ac, aux_out));
+        BuildAndEncodeHistograms(memory_manager, hist_params, num_contexts,
+                                 enc_state->passes[i].ac_tokens,
+                                 &enc_state->passes[i].codes, writer,
+                                 LayerType::Ac, aux_out));
     (void)cost;
+    if (!measured.empty()) {
+      auto& recorded = aux_out->ac_context_counts;
+      if (recorded.size() < measured.size()) recorded.resize(measured.size());
+      for (size_t c = 0; c < measured.size(); ++c) {
+        const Histogram& histo = measured[c];
+        if (recorded[c].size() < histo.counts.size()) {
+          recorded[c].resize(histo.counts.size());
+        }
+        for (size_t k = 0; k < histo.counts.size(); ++k) {
+          recorded[c][k] += histo.counts[k];
+        }
+      }
+    }
   }
 
   return true;
