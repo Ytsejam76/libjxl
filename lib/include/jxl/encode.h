@@ -446,6 +446,13 @@ typedef enum {
    */
   JXL_ENC_FRAME_SETTING_DEFAULT_COEFF_ORDER = 43,
 
+  /** Code the image data with prefix (Huffman) codes instead of letting the
+   * encoder choose ANS where it compresses better. Prefix codes are cheaper
+   * to build and to write, at some cost in density. -1 = default (encoder
+   * chooses), 0 = encoder chooses, 1 = prefix codes only.
+   */
+  JXL_ENC_FRAME_SETTING_PREFIX_CODES = 44,
+
   /** Enum value not to be used as an option. This value is added to force the
    * C compiler to have the enum to take a known size.
    */

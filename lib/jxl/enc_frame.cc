@@ -1367,6 +1367,7 @@ Status EncodeGlobalACInfo(PassesEncoderState* enc_state, BitWriter* writer,
     if (enc_state->cparams.speed_tier > SpeedTier::kTortoise) {
       hist_params.lz77_method = HistogramParams::LZ77Method::kNone;
     }
+    hist_params.force_huffman = enc_state->cparams.force_prefix_codes;
     if (enc_state->cparams.decoding_speed_tier >= 1) {
       hist_params.max_histograms = 6;
     }
