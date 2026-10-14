@@ -39,6 +39,9 @@ struct CompressParams {
 
   bool disable_perceptual_optimizations = false;
 
+  // Code the image data with prefix codes only, never ANS.
+  bool force_prefix_codes = false;
+
   SpeedTier speed_tier = SpeedTier::kSquirrel;
   int brotli_effort = -1;
 

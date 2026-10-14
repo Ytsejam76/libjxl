@@ -2134,6 +2134,13 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetOption(
     case JXL_ENC_FRAME_SETTING_JPEG_RECON_LFS:
       frame_settings->values.cparams.force_lfs_jpeg_recompression = value;
       break;
+    case JXL_ENC_FRAME_SETTING_PREFIX_CODES:
+      if (value < -1 || value > 1) {
+        return JXL_API_ERROR(frame_settings->enc, JXL_ENC_ERR_NOT_SUPPORTED,
+                             "Prefix codes has to be in [-1..1]");
+      }
+      frame_settings->values.cparams.force_prefix_codes = (value == 1);
+      break;
     case JXL_ENC_FRAME_SETTING_STRIP_ALPHA:
       if (value < -1 || value > 2) {
         return JXL_API_ERROR(frame_settings->enc, JXL_ENC_ERR_NOT_SUPPORTED,
