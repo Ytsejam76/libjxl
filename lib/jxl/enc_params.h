@@ -42,6 +42,9 @@ struct CompressParams {
   // Use the default coefficient order instead of computing a custom one.
   bool default_coeff_order = false;
 
+  // Code the image data with prefix codes only, never ANS.
+  bool force_prefix_codes = false;
+
   // Caller-provided AC histograms (see JxlEncoderSetFrameACHistograms): one
   // histogram index per AC context, and num_histograms rows of
   // ac_preset_alphabet_size counts. Empty if unset.

@@ -1421,6 +1421,7 @@ HistogramParams HistogramParams::ForModular(
     const std::vector<uint8_t>& extra_dc_precision, bool streaming_mode) {
   HistogramParams params;
   params.streaming_mode = streaming_mode;
+  params.force_huffman = cparams.force_prefix_codes;
   if (cparams.speed_tier > SpeedTier::kKitten) {
     params.clustering = HistogramParams::ClusteringType::kFast;
     params.ans_histogram_strategy =
