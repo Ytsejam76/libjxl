@@ -44,16 +44,9 @@ Status InitializePassesSharedState(const FrameHeader& frame_header,
       shared->cmap, ColorCorrelationMap::Create(memory_manager, frame_dim.xsize,
                                                 frame_dim.ysize));
 
-  // In the decoder, we allocate coeff orders afterwards, when we know how many
-  // we will actually need.
+  // Coeff orders are allocated afterwards, when we know how many we will
+  // actually need.
   shared->coeff_order_size = kCoeffOrderMaxSize;
-  if (encoder &&
-      shared->coeff_orders.size() <
-          frame_header.passes.num_passes * kCoeffOrderMaxSize &&
-      frame_header.encoding == FrameEncoding::kVarDCT) {
-    shared->coeff_orders.resize(frame_header.passes.num_passes *
-                                kCoeffOrderMaxSize);
-  }
 
   JXL_ASSIGN_OR_RETURN(shared->quant_dc,
                        ImageB::Create(memory_manager, frame_dim.xsize_blocks,
