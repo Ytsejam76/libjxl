@@ -72,7 +72,8 @@ Status ComputeCoeffOrder(SpeedTier speed, const ACImage& ac_image,
                          uint32_t current_used_orders,
                          coeff_order_t* JXL_RESTRICT order) {
   JxlMemoryManager* memory_manager = ac_strategy.memory_manager();
-  std::vector<int64_t> num_zeros(kCoeffOrderMaxSize);
+  // Only read for the orders computed below.
+  std::vector<int64_t> num_zeros;
   // If compressing at high speed and only using 8x8 DCTs, only consider a
   // subset of blocks.
   double block_fraction = 1.0f;
@@ -84,6 +85,7 @@ Status ComputeCoeffOrder(SpeedTier speed, const ACImage& ac_image,
   // No need to compute number of zero coefficients if all orders are the
   // default.
   if (current_used_orders != 0) {
+    num_zeros.assign(kCoeffOrderMaxSize, 0);
     uint64_t threshold =
         (std::numeric_limits<uint64_t>::max() >> 32) * block_fraction;
     uint64_t s[2] = {static_cast<uint64_t>(0x94D049BB133111EBull),

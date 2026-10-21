@@ -1199,8 +1199,20 @@ Status ComputeAllCoeffOrders(PassesEncoderState& enc_state,
       enc_state.cparams.speed_tier, enc_state.shared.ac_strategy,
       Rect(enc_state.shared.raw_quant_field),
       enc_state.cparams.default_coeff_order);
-  enc_state.used_orders.resize(enc_state.progressive_splitter.GetNumPasses());
-  for (size_t i = 0; i < enc_state.progressive_splitter.GetNumPasses(); i++) {
+  // Orders are only written and read for the transforms in use, so the table
+  // only has to reach the last of them; it only grows, so the orders kept
+  // from earlier calls in streaming mode stay in place.
+  const size_t num_passes = enc_state.progressive_splitter.GetNumPasses();
+  const uint32_t used = used_orders_info.first | enc_state.used_acs;
+  const size_t needed =
+      (num_passes - 1) * enc_state.shared.coeff_order_size +
+      std::max<size_t>(
+          1, used == 0 ? 0 : CoeffOrderOffset(FloorLog2Nonzero(used) + 1, 0));
+  if (enc_state.shared.coeff_orders.size() < needed) {
+    enc_state.shared.coeff_orders.resize(needed);
+  }
+  enc_state.used_orders.resize(num_passes);
+  for (size_t i = 0; i < num_passes; i++) {
     JXL_RETURN_IF_ERROR(ComputeCoeffOrder(
         enc_state.cparams.speed_tier, *enc_state.coeffs[i],
         enc_state.shared.ac_strategy, frame_dim, enc_state.used_orders[i],
@@ -1564,10 +1576,6 @@ Status ComputeEncodingData(
       shared.cmap, ColorCorrelationMap::Create(memory_manager, frame_dim.xsize,
                                                frame_dim.ysize));
   shared.coeff_order_size = kCoeffOrderMaxSize;
-  if (frame_header.encoding == FrameEncoding::kVarDCT) {
-    shared.coeff_orders.resize(frame_header.passes.num_passes *
-                               kCoeffOrderMaxSize);
-  }
 
   JXL_ASSIGN_OR_RETURN(shared.quant_dc,
                        ImageB::Create(memory_manager, frame_dim.xsize_blocks,
